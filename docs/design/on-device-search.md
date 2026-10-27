@@ -309,6 +309,25 @@ Python:
 - Batch splitting, model_id and dim in the header, normalization, quantization, and that a
   response of the wrong length is rejected.
 
+### Behaviours round 2 pins
+
+- A vector query ranks every chunk, including those with a negative cosine; the caller decides
+  how far down the list to show.
+- Hybrid takes `SEARCH_MAX_HITS` from each list before fusing, so a chunk outside the top eight
+  of both lists is never returned.
+- On an index with no vectors, hybrid returns the BM25 result whatever vector or length it is
+  handed, even none.
+- An index whose `dtype` is float32 has no vector support yet: the vector query returns
+  `SEARCH_ERR_FORMAT` rather than guessing.
+- The response parser rejects an empty model name, a reply carrying more than one embedding, and
+  an all-zero vector.
+- Chunks are embedded exactly as stored (`title\nbody`). `nomic-embed-text` recommends
+  `search_document:` / `search_query:` prefixes; they are not applied here because the builder
+  must stay model-agnostic. Adding `--doc-prefix` / `--query-prefix` (default empty) is the open
+  improvement.
+- Python's compensated `sum()` is avoided in the builder so its accumulation matches the C
+  loop bit for bit; both sides round half to even.
+
 ### Acceptance for round 2
 
 1. Host C suite and Python suite pass with no pre-existing expectation changed.
