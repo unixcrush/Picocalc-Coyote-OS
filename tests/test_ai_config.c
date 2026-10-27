@@ -87,7 +87,9 @@ static void check_serialize_defaults(void) {
         "max_predict=384\n"
         "system_prompt=" AI_CONFIG_DEFAULT_SYSTEM_PROMPT "\n"
         "temperature=80\n"
-        "utc_offset_minutes=0\n";
+        "utc_offset_minutes=0\n"
+        "embed_url=\n"
+        "embed_model=nomic-embed-text\n";
     static const char expected_with_host[] =
         "version=1\n"
         "ssid=\n"
@@ -103,7 +105,9 @@ static void check_serialize_defaults(void) {
         "max_predict=384\n"
         "system_prompt=" AI_CONFIG_DEFAULT_SYSTEM_PROMPT "\n"
         "temperature=80\n"
-        "utc_offset_minutes=0\n";
+        "utc_offset_minutes=0\n"
+        "embed_url=\n"
+        "embed_model=nomic-embed-text\n";
     ai_config_t config;
     ai_config_t reloaded;
     ai_config_parser_t parser;
@@ -490,6 +494,48 @@ static void check_set_provider(void) {
     CHECK(ai_config_set_provider(&config, NULL) == AI_CONFIG_INVALID_ARGUMENT);
 }
 
+static void check_embedding_service(void) {
+    ai_config_t config;
+    ai_config_t reloaded;
+    ai_config_parser_t parser;
+    char output[2048];
+    size_t length;
+
+    /* An ai.ini from before these keys keeps the defaults. */
+    CHECK(parse_text(&config, &parser, "version=1\nprovider=ollama\n", 4u) == AI_CONFIG_OK);
+    CHECK_STR_EQ(config.embed_url, "");
+    CHECK_STR_EQ(config.embed_model, AI_CONFIG_EMBED_MODEL_DEFAULT);
+
+    CHECK(parse_text(&config, &parser, "embed_url = http://wang.local:11434 \nembed_model=all-minilm\n", 5u) ==
+          AI_CONFIG_OK);
+    CHECK_STR_EQ(config.embed_url, "http://wang.local:11434");
+    CHECK_STR_EQ(config.embed_model, "all-minilm");
+    CHECK(ai_config_serialize(&config, output, sizeof(output), &length) == AI_CONFIG_OK);
+    CHECK(strstr(output, "\nembed_url=http://wang.local:11434\nembed_model=all-minilm\n") != NULL);
+    CHECK(parse_text(&reloaded, &parser, output, 9u) == AI_CONFIG_OK);
+    CHECK_STR_EQ(reloaded.embed_url, "http://wang.local:11434");
+    CHECK_STR_EQ(reloaded.embed_model, "all-minilm");
+
+    /* An empty URL is the default; an empty model is not a model. */
+    CHECK(parse_text(&config, &parser, "embed_url=\n", 99u) == AI_CONFIG_OK);
+    CHECK(parse_text(&config, &parser, "embed_model=\n", 99u) == AI_CONFIG_INVALID_VALUE);
+    CHECK_STR_EQ(ai_config_parser_error_key(&parser), "embed_model");
+    CHECK(parse_text(&config, &parser, "embed_url=http://a\x01b\n", 99u) == AI_CONFIG_INVALID_VALUE);
+    CHECK(parse_text(&config, &parser, "embed_url=a\nembed_url=b\n", 99u) == AI_CONFIG_DUPLICATE_KEY);
+    CHECK(parse_text(&config, &parser, "embed_model=a\nembed_model=b\n", 99u) == AI_CONFIG_DUPLICATE_KEY);
+
+    CHECK(ai_config_init(&config) == AI_CONFIG_OK);
+    memset(config.embed_url, 'u', sizeof(config.embed_url) - 1u);
+    CHECK(ai_config_serialize(&config, output, sizeof(output), &length) == AI_CONFIG_OK);
+    CHECK(parse_text(&reloaded, &parser, output, 64u) == AI_CONFIG_OK);
+    CHECK(strlen(reloaded.embed_url) == sizeof(reloaded.embed_url) - 1u);
+    config.embed_model[0] = '\0';
+    CHECK(ai_config_serialize(&config, output, sizeof(output), &length) == AI_CONFIG_INVALID_VALUE);
+    CHECK(ai_config_init(&config) == AI_CONFIG_OK);
+    strcpy(config.embed_url, "http://x\t");
+    CHECK(ai_config_serialize(&config, output, sizeof(output), &length) == AI_CONFIG_INVALID_VALUE);
+}
+
 void test_ai_config(void) {
     check_defaults();
     check_incremental_parse();
@@ -505,4 +551,5 @@ void test_ai_config(void) {
     check_deepseek_defaults();
     check_deepseek_validation();
     check_set_provider();
+    check_embedding_service();
 }

@@ -19,13 +19,15 @@ enum {
     KEY_SYSTEM_PROMPT,
     KEY_TEMPERATURE,
     KEY_UTC_OFFSET,
+    KEY_EMBED_URL,
+    KEY_EMBED_MODEL,
     KEY_UNKNOWN
 };
 
 static const char *const key_names[] = {
     "version", "ssid", "password", "provider", "host", "port", "model",
     "bearer_token", "connect_timeout_ms", "request_timeout_ms", "idle_timeout_ms",
-    "max_predict", "system_prompt", "temperature", "utc_offset_minutes"
+    "max_predict", "system_prompt", "temperature", "utc_offset_minutes", "embed_url", "embed_model"
 };
 
 ai_config_status_t ai_config_init(ai_config_t *config) {
@@ -45,6 +47,7 @@ ai_config_status_t ai_config_init(ai_config_t *config) {
     config->temperature = 80u;
     memcpy(config->system_prompt, AI_CONFIG_DEFAULT_SYSTEM_PROMPT,
            sizeof(AI_CONFIG_DEFAULT_SYSTEM_PROMPT));
+    memcpy(config->embed_model, AI_CONFIG_EMBED_MODEL_DEFAULT, sizeof(AI_CONFIG_EMBED_MODEL_DEFAULT));
     return AI_CONFIG_OK;
 }
 
@@ -298,16 +301,28 @@ static ai_config_status_t parse_i32(ai_config_parser_t *parser, int id, const ch
     return AI_CONFIG_OK;
 }
 
+/* No control characters: the serializer could not write them back. */
+static int printable(const char *value) {
+    const unsigned char *p;
+
+    for (p = (const unsigned char *)value; *p != '\0'; p++) {
+        if (*p < 0x20u || *p == 0x7fu) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static ai_config_status_t parse_known(ai_config_parser_t *parser, int id, const char *value) {
     ai_config_t *config = parser->config;
     uint32_t number;
     int32_t offset;
     ai_config_status_t status = AI_CONFIG_OK;
 
-    if ((parser->seen_keys & (uint16_t)(1u << (unsigned)id)) != 0u) {
+    if ((parser->seen_keys & (1ul << (unsigned)id)) != 0u) {
         return fail(parser, AI_CONFIG_DUPLICATE_KEY, id);
     }
-    parser->seen_keys |= (uint16_t)(1u << (unsigned)id);
+    parser->seen_keys |= (uint32_t)(1ul << (unsigned)id);
 
     switch (id) {
         case KEY_VERSION:
@@ -365,6 +380,16 @@ static ai_config_status_t parse_known(ai_config_parser_t *parser, int id, const 
             }
             return copy_value(parser, id, config->system_prompt, sizeof(config->system_prompt), value);
         }
+        case KEY_EMBED_URL:
+            if (!printable(value)) {
+                return fail(parser, AI_CONFIG_INVALID_VALUE, id);
+            }
+            return copy_value(parser, id, config->embed_url, sizeof(config->embed_url), value);
+        case KEY_EMBED_MODEL:
+            if (*value == '\0' || !printable(value)) {
+                return fail(parser, AI_CONFIG_INVALID_VALUE, id);
+            }
+            return copy_value(parser, id, config->embed_model, sizeof(config->embed_model), value);
         case KEY_TEMPERATURE:
             status = parse_u32(parser, id, value, AI_CONFIG_TEMPERATURE_MIN,
                                AI_CONFIG_TEMPERATURE_MAX, &number);
@@ -492,7 +517,7 @@ ai_config_status_t ai_config_parser_feed(ai_config_parser_t *parser, const void 
 }
 
 static int seen(const ai_config_parser_t *parser, int id) {
-    return (parser->seen_keys & (uint16_t)(1u << (unsigned)id)) != 0u;
+    return (parser->seen_keys & (1ul << (unsigned)id)) != 0u;
 }
 
 /* Fill in what a cloud provider's file left out, then apply the cross-field
@@ -620,6 +645,8 @@ ai_config_status_t ai_config_serialize(const ai_config_t *config, char *destinat
         !serializable_text(config->model, sizeof(config->model), 1) ||
         !serializable_text(config->bearer_token, sizeof(config->bearer_token), 1) ||
         !serializable_text(config->system_prompt, sizeof(config->system_prompt), 1) ||
+        !serializable_text(config->embed_url, sizeof(config->embed_url), 1) ||
+        !serializable_text(config->embed_model, sizeof(config->embed_model), 0) ||
         config->port == 0u ||
         config->connect_timeout_ms < AI_CONFIG_CONNECT_TIMEOUT_MS_MIN ||
         config->connect_timeout_ms > AI_CONFIG_CONNECT_TIMEOUT_MS_MAX ||
@@ -651,7 +678,9 @@ ai_config_status_t ai_config_serialize(const ai_config_t *config, char *destinat
                sizeof("system_prompt=\n") - 1u + strlen(config->system_prompt) +
                sizeof("temperature=\n") - 1u + decimal_length(config->temperature) +
                sizeof("utc_offset_minutes=\n") - 1u + (config->utc_offset_minutes < 0 ? 1u : 0u) +
-               decimal_length(magnitude_of(config->utc_offset_minutes));
+               decimal_length(magnitude_of(config->utc_offset_minutes)) +
+               sizeof("embed_url=\n") - 1u + strlen(config->embed_url) +
+               sizeof("embed_model=\n") - 1u + strlen(config->embed_model);
     *length = required;
     if (destination == NULL || capacity <= required) {
         return AI_CONFIG_NO_SPACE;
@@ -691,6 +720,8 @@ ai_config_status_t ai_config_serialize(const ai_config_t *config, char *destinat
                 config->utc_offset_minutes < 0 ? "utc_offset_minutes=-" : "utc_offset_minutes=");
     append_number(destination, &offset, magnitude_of(config->utc_offset_minutes));
     destination[offset++] = '\n';
+    APPEND_FIELD("embed_url", config->embed_url);
+    APPEND_FIELD("embed_model", config->embed_model);
 
 #undef APPEND_NUMBER_FIELD
 #undef APPEND_FIELD

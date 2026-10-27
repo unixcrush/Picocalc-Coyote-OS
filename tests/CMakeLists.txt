@@ -40,6 +40,7 @@ add_library(coyote_ai STATIC
     "${COYOTE_ROOT}/ai/wifi_manager.c"
     "${COYOTE_ROOT}/ai/wifi_scan.c"
     "${COYOTE_ROOT}/ai/search_index.c"
+    "${COYOTE_ROOT}/ai/embed_client.c"
     "${COYOTE_ROOT}/time/time_sync.c"
     "${COYOTE_ROOT}/tls/tls_trust.c"
     "${COYOTE_ROOT}/storage/export.c"
@@ -97,6 +98,7 @@ add_executable(coyote_ai_tests
     test_mode_menu.c
     test_usb_disk.c
     test_search_index.c
+    test_embed_client.c
 )
 target_link_libraries(coyote_ai_tests PRIVATE coyote_ui coyote_ai)
 target_compile_options(coyote_ai_tests PRIVATE -Wall -Wextra -Werror)

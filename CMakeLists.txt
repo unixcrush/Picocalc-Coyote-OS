@@ -45,6 +45,7 @@ add_executable(coyote
         ai/wifi_manager.c
         ai/wifi_scan.c
         ai/search_index.c
+        ai/embed_client.c
         time/time_sync.c
         time/time_service.c
         ai/http_stream.c

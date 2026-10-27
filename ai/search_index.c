@@ -536,6 +536,202 @@ search_status_t search_index_query(search_index_t *index, const char *query,
     return SEARCH_OK;
 }
 
+/* ---- vectors ----------------------------------------------------------- */
+
+static int32_t dot_i8(const int8_t *a, const uint8_t *b, size_t count) {
+    int32_t sum = 0;
+    size_t i;
+
+    for (i = 0u; i < count; i++) {
+        sum += (int32_t)a[i] * (int8_t)b[i];
+    }
+    return sum;
+}
+
+/* floor(numerator / denominator) for a positive denominator. */
+static int64_t floor_div(int64_t numerator, int64_t denominator) {
+    int64_t quotient = numerator / denominator;
+
+    if (numerator % denominator != 0 && numerator < 0) {
+        quotient--;
+    }
+    return quotient;
+}
+
+/* dot x 65536 / (127 x 127), rounded half up, in integers; vector_q16 in
+ * build_index.py.  Never exactly half way: 127 x 127 is odd.  A file or query
+ * whose vectors are not normalized can pass int32, so the score is held to
+ * it. */
+static int32_t vector_q16(int32_t dot) {
+    int64_t q16 = floor_div((int64_t)dot * 2 * 65536 + 127 * 127, 2 * 127 * 127);
+
+    if (q16 > INT32_MAX) {
+        return INT32_MAX;
+    }
+    if (q16 < INT32_MIN) {
+        return INT32_MIN;
+    }
+    return (int32_t)q16;
+}
+
+search_status_t search_index_query_vectors(search_index_t *index, const int8_t *query,
+                                           size_t dim, search_hit_t *hits, size_t max_hits,
+                                           size_t *hit_count) {
+    const search_section_t *vectors;
+    uint64_t offset = 0u;
+    uint32_t chunk_id = 0u;
+    size_t done = 0u; /* of the current chunk's vector */
+    int32_t dot = 0;
+
+    if (hit_count != NULL) {
+        *hit_count = 0u;
+    }
+    if (index == NULL || query == NULL || hits == NULL || hit_count == NULL || index->file == NULL) {
+        return SEARCH_ERR_ARGUMENT;
+    }
+    if (index->dim == 0u) {
+        return SEARCH_ERR_NO_VECTORS;
+    }
+    if (dim != index->dim) {
+        return SEARCH_ERR_DIM;
+    }
+    vectors = &index->sections[SEARCH_SECTION_VECTORS];
+    /* Open held the section to chunk_count x dim elements; only int8 is
+     * scored. */
+    if (index->dtype != SEARCH_DTYPE_INT8 || vectors->len != (uint64_t)index->chunk_count * dim) {
+        return SEARCH_ERR_FORMAT;
+    }
+    if (max_hits > SEARCH_MAX_HITS) {
+        max_hits = SEARCH_MAX_HITS;
+    }
+
+    /* One pass, front to back.  A vector may straddle two reads. */
+    while (offset < vectors->len) {
+        size_t length = vectors->len - offset > sizeof(index->io) ? sizeof(index->io)
+                                                                  : (size_t)(vectors->len - offset);
+        size_t at = 0u;
+        search_status_t status = section_read(index, SEARCH_SECTION_VECTORS, offset, index->io, length);
+
+        if (status != SEARCH_OK) {
+            return status;
+        }
+        while (at < length) {
+            size_t take = dim - done < length - at ? dim - done : length - at;
+
+            dot += dot_i8(query + done, index->io + at, take);
+            done += take;
+            at += take;
+            if (done == dim) {
+                keep_hit(hits, max_hits, hit_count, chunk_id, vector_q16(dot));
+                chunk_id++;
+                done = 0u;
+                dot = 0;
+            }
+        }
+        offset += length;
+    }
+    return SEARCH_OK;
+}
+
+/* A chunk's fused score, kept as the exact fraction numerator / denominator. */
+typedef struct {
+    uint32_t chunk_id;
+    uint32_t numerator;
+    uint32_t denominator;
+} fused_t;
+
+static void fuse_rank(fused_t *fused, size_t *count, uint32_t chunk_id, size_t rank) {
+    uint32_t denominator = SEARCH_RRF_K + (uint32_t)rank;
+    size_t i;
+
+    for (i = 0u; i < *count; i++) {
+        if (fused[i].chunk_id == chunk_id) {
+            /* a/b + 1/d = (a*d + b) / (b*d) */
+            fused[i].numerator = fused[i].numerator * denominator + fused[i].denominator;
+            fused[i].denominator *= denominator;
+            return;
+        }
+    }
+    fused[*count].chunk_id = chunk_id;
+    fused[*count].numerator = 1u;
+    fused[*count].denominator = denominator;
+    (*count)++;
+}
+
+/* Whether a ranks before b: the larger fused score, then the lower chunk id. */
+static int fused_before(const fused_t *a, const fused_t *b) {
+    uint64_t left = (uint64_t)a->numerator * b->denominator;
+    uint64_t right = (uint64_t)b->numerator * a->denominator;
+
+    return left != right ? left > right : a->chunk_id < b->chunk_id;
+}
+
+search_status_t search_index_query_hybrid(search_index_t *index, const char *text,
+                                          const int8_t *query_vector, size_t dim,
+                                          search_hit_t *hits, size_t max_hits, size_t *hit_count) {
+    search_hit_t keyword[SEARCH_MAX_HITS];
+    search_hit_t nearest[SEARCH_MAX_HITS];
+    size_t keyword_count;
+    size_t nearest_count;
+    fused_t fused[2u * SEARCH_MAX_HITS];
+    size_t fused_count = 0u;
+    size_t i;
+    size_t j;
+    search_status_t status;
+
+    if (hit_count != NULL) {
+        *hit_count = 0u;
+    }
+    if (index == NULL || text == NULL || hits == NULL || hit_count == NULL || index->file == NULL) {
+        return SEARCH_ERR_ARGUMENT;
+    }
+    if (index->dim == 0u) {
+        return search_index_query(index, text, hits, max_hits, hit_count);
+    }
+    if (query_vector == NULL) {
+        return SEARCH_ERR_ARGUMENT;
+    }
+    if (dim != index->dim) {
+        return SEARCH_ERR_DIM;
+    }
+    if (max_hits > SEARCH_MAX_HITS) {
+        max_hits = SEARCH_MAX_HITS;
+    }
+
+    status = search_index_query(index, text, keyword, SEARCH_MAX_HITS, &keyword_count);
+    if (status == SEARCH_OK) {
+        status = search_index_query_vectors(index, query_vector, dim, nearest, SEARCH_MAX_HITS, &nearest_count);
+    }
+    if (status != SEARCH_OK) {
+        return status;
+    }
+    for (i = 0u; i < keyword_count; i++) {
+        fuse_rank(fused, &fused_count, keyword[i].chunk_id, i + 1u);
+    }
+    for (i = 0u; i < nearest_count; i++) {
+        fuse_rank(fused, &fused_count, nearest[i].chunk_id, i + 1u);
+    }
+
+    /* Insertion sort: there are at most 2 x SEARCH_MAX_HITS. */
+    for (i = 1u; i < fused_count; i++) {
+        fused_t moving = fused[i];
+
+        for (j = i; j > 0u && fused_before(&moving, &fused[j - 1u]); j--) {
+            fused[j] = fused[j - 1u];
+        }
+        fused[j] = moving;
+    }
+    for (i = 0u; i < fused_count && i < max_hits; i++) {
+        /* x 65536 rounded half up; at most 2/61 x 65536, so it fits. */
+        uint64_t numerator = (uint64_t)fused[i].numerator * 2u * 65536u + fused[i].denominator;
+
+        hits[i].chunk_id = fused[i].chunk_id;
+        hits[i].score_q16 = (int32_t)(numerator / (2u * (uint64_t)fused[i].denominator));
+    }
+    *hit_count = i;
+    return SEARCH_OK;
+}
+
 /* ---- text -------------------------------------------------------------- */
 
 /* Where a chunk's text lies in the text section. */

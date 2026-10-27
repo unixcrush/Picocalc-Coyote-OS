@@ -529,6 +529,286 @@ static void check_damaged(void) {
     search_index_close(&index_);
 }
 
+/* ---- vectors (round 2) ------------------------------------------------- */
+
+#define VECTOR_DIM 4u
+
+/*
+ * One normalized int8 vector per chunk, as the builder quantizes them.
+ * Against VECTOR_QUERY chunk 5 has the largest components in sum but only
+ * the third-largest cosine.  For "radio", BM25 ranks 5, 1, 0; these vectors
+ * rank 0, 1, 5, 2, 3, 4.  tools/search_index/test_build_index.py builds the
+ * same index and expects the same scores.
+ */
+static const int8_t chunk_vectors[CHUNK_COUNT][VECTOR_DIM] = {
+    {127, 0, 0, 0}, {110, 63, 0, 0}, {0, 127, 0, 0}, {0, 0, 127, 0}, {-127, 0, 0, 0}, {90, 90, 0, 0},
+};
+static const int8_t vector_query[VECTOR_DIM] = {127, 0, 0, 0};
+
+static uint8_t vector_fixture[16384];
+static size_t vector_fixture_length;
+
+/* The round 1 fixture with a vectors section of dim bytes per chunk, chunk i's
+ * vector written by fill. */
+static void build_vector_fixture(size_t dim, void (*fill)(size_t chunk, int8_t *vector, size_t dim)) {
+    size_t at = fixture_length;
+    size_t i;
+
+    memcpy(vector_fixture, fixture, fixture_length);
+    put_u16(vector_fixture + 6, SEARCH_FLAG_NORMALIZED | SEARCH_FLAG_INT8);
+    put_u16(vector_fixture + 8, (uint32_t)dim);
+    put_u16(vector_fixture + 10, SEARCH_DTYPE_INT8);
+    memcpy(vector_fixture + 32, "test-model", 10u);
+    for (i = 0u; i < CHUNK_COUNT; i++) {
+        fill(i, (int8_t *)(vector_fixture + at), dim);
+        at += dim;
+    }
+    set_section(vector_fixture, SEARCH_SECTION_VECTORS, fixture_length, CHUNK_COUNT * dim);
+    vector_fixture_length = align4(at);
+    memset(vector_fixture + at, 0, vector_fixture_length - at);
+    set_section(vector_fixture, SEARCH_SECTION_RESERVED, vector_fixture_length, 0u);
+    seal(vector_fixture, vector_fixture_length);
+    write_file(vector_fixture, vector_fixture_length);
+}
+
+static void fill_fixed(size_t chunk, int8_t *vector, size_t dim) {
+    memcpy(vector, chunk_vectors[chunk], dim);
+}
+
+/* A vector longer than SEARCH_IO_CHUNK holds a few of: each read ends inside
+ * one. */
+#define LONG_DIM 1500u
+
+static int8_t long_value(size_t chunk, size_t i) {
+    return (int8_t)((int)((chunk * 7u + i * 13u) % 255u) - 127);
+}
+
+static void fill_long(size_t chunk, int8_t *vector, size_t dim) {
+    size_t i;
+
+    for (i = 0u; i < dim; i++) {
+        vector[i] = long_value(chunk, i);
+    }
+}
+
+static size_t run_vectors(const int8_t *query, size_t dim, size_t max_hits, search_hit_t *hits,
+                          search_status_t *status) {
+    size_t count = 99u;
+
+    *status = search_index_query_vectors(&index_, query, dim, hits, max_hits, &count);
+    return count;
+}
+
+static size_t run_hybrid(const char *text, const int8_t *query, size_t dim, size_t max_hits, search_hit_t *hits,
+                         search_status_t *status) {
+    size_t count = 99u;
+
+    *status = search_index_query_hybrid(&index_, text, query, dim, hits, max_hits, &count);
+    return count;
+}
+
+static void check_vector_ranking(void) {
+    static const uint32_t order[] = {0u, 1u, 5u, 2u, 3u, 4u};
+    static const int32_t scores[] = {65536, 56763, 46443, 0, 0, -65536};
+    static const int8_t other[VECTOR_DIM] = {0, 90, 0, 90};
+    search_hit_t hits[SEARCH_MAX_HITS];
+    search_status_t status;
+    size_t count;
+    size_t i;
+
+    build_vector_fixture(VECTOR_DIM, fill_fixed);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    CHECK(index_.dim == VECTOR_DIM && index_.dtype == SEARCH_DTYPE_INT8);
+
+    /* By cosine: chunk 0 points along the query; chunk 5's components sum to
+     * more but point away from it.  Every chunk is ranked, the opposite one
+     * last, and the zero ties fall to the lower chunk id. */
+    count = run_vectors(vector_query, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK);
+    CHECK(count == CHUNK_COUNT);
+    for (i = 0u; i < CHUNK_COUNT; i++) {
+        CHECK(hits[i].chunk_id == order[i] && hits[i].score_q16 == scores[i]);
+    }
+
+    count = run_vectors(other, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK && count == CHUNK_COUNT);
+    CHECK(hits[0].chunk_id == 2u && hits[0].score_q16 == 46443);
+    CHECK(hits[1].chunk_id == 5u && hits[1].score_q16 == 32912);
+    CHECK(hits[2].chunk_id == 1u && hits[2].score_q16 == 23039);
+
+    /* max_hits keeps the best. */
+    count = run_vectors(vector_query, VECTOR_DIM, 2u, hits, &status);
+    CHECK(status == SEARCH_OK && count == 2u);
+    CHECK(hits[0].chunk_id == 0u && hits[1].chunk_id == 1u);
+    count = run_vectors(vector_query, VECTOR_DIM, 0u, hits, &status);
+    CHECK(status == SEARCH_OK && count == 0u);
+
+    /* The BM25 side still answers from the same file. */
+    count = run_query("radio", SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK && count == 3u && hits[0].chunk_id == 5u && hits[0].score_q16 == 66035);
+    search_index_close(&index_);
+}
+
+static void check_vector_errors(void) {
+    static const int8_t short_query[VECTOR_DIM - 1u] = {127, 0, 0};
+    search_hit_t hits[SEARCH_MAX_HITS];
+    search_status_t status;
+    size_t count = 99u;
+
+    build_vector_fixture(VECTOR_DIM, fill_fixed);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    CHECK(run_vectors(short_query, VECTOR_DIM - 1u, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_DIM);
+    CHECK(run_vectors(vector_query, VECTOR_DIM + 1u, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_DIM);
+    CHECK(run_hybrid("radio", short_query, VECTOR_DIM - 1u, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_DIM);
+
+    CHECK(search_index_query_vectors(NULL, vector_query, VECTOR_DIM, hits, 1u, &count) == SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_vectors(&index_, NULL, VECTOR_DIM, hits, 1u, &count) == SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_vectors(&index_, vector_query, VECTOR_DIM, NULL, 1u, &count) == SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_vectors(&index_, vector_query, VECTOR_DIM, hits, 1u, NULL) == SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_hybrid(NULL, "radio", vector_query, VECTOR_DIM, hits, 1u, &count) ==
+          SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_hybrid(&index_, NULL, vector_query, VECTOR_DIM, hits, 1u, &count) ==
+          SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_hybrid(&index_, "radio", NULL, VECTOR_DIM, hits, 1u, &count) == SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_hybrid(&index_, "radio", vector_query, VECTOR_DIM, NULL, 1u, &count) ==
+          SEARCH_ERR_ARGUMENT);
+    CHECK(search_index_query_hybrid(&index_, "radio", vector_query, VECTOR_DIM, hits, 1u, NULL) ==
+          SEARCH_ERR_ARGUMENT);
+    search_index_close(&index_);
+    /* A closed index. */
+    CHECK(search_index_query_vectors(&index_, vector_query, VECTOR_DIM, hits, 1u, &count) == SEARCH_ERR_ARGUMENT);
+    CHECK(count == 0u);
+    CHECK(search_index_query_hybrid(&index_, "radio", vector_query, VECTOR_DIM, hits, 1u, &count) ==
+          SEARCH_ERR_ARGUMENT);
+
+    /* A vectors section open accepts but the scan cannot score: f32. */
+    put_u16(vector_fixture + 10, SEARCH_DTYPE_F32);
+    put_u16(vector_fixture + 8, 1u);
+    seal(vector_fixture, vector_fixture_length);
+    write_file(vector_fixture, vector_fixture_length);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    CHECK(run_vectors(vector_query, 1u, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_FORMAT);
+    search_index_close(&index_);
+
+    /* A section length that disagrees with chunk_count x dim. */
+    put_u16(vector_fixture + 10, SEARCH_DTYPE_INT8);
+    put_u16(vector_fixture + 8, VECTOR_DIM + 1u);
+    seal(vector_fixture, vector_fixture_length);
+    write_file(vector_fixture, vector_fixture_length);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_ERR_FORMAT);
+
+    /* The round 1 fixture has no vectors. */
+    write_file(fixture, fixture_length);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    CHECK(run_vectors(vector_query, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_NO_VECTORS);
+    CHECK(run_vectors(vector_query, 0u, SEARCH_MAX_HITS, hits, &status) == 0u);
+    CHECK(status == SEARCH_ERR_NO_VECTORS);
+    search_index_close(&index_);
+}
+
+static void check_hybrid(void) {
+    search_hit_t hits[SEARCH_MAX_HITS];
+    search_hit_t keyword[SEARCH_MAX_HITS];
+    search_status_t status;
+    size_t count;
+    size_t keyword_count;
+    size_t i;
+
+    build_vector_fixture(VECTOR_DIM, fill_fixed);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+
+    /* Chunk 5 is 1st for BM25 and 3rd for vectors; chunk 0 is 3rd and 1st.
+     * Both fuse to 1/61 + 1/63 and tie, so the lower id leads.  Chunk 1, 2nd
+     * in both, fuses to 2/62: less, though rounding each term to Q16 first
+     * would have tied all three. */
+    count = run_hybrid("radio", vector_query, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK);
+    CHECK(count == CHUNK_COUNT);
+    CHECK(hits[0].chunk_id == 0u && hits[0].score_q16 == 2115);
+    CHECK(hits[1].chunk_id == 5u && hits[1].score_q16 == 2115);
+    CHECK(hits[2].chunk_id == 1u && hits[2].score_q16 == 2114);
+    CHECK(hits[3].chunk_id == 2u && hits[3].score_q16 == 1024);
+    CHECK(hits[4].chunk_id == 3u && hits[4].score_q16 == 1008);
+    CHECK(hits[5].chunk_id == 4u && hits[5].score_q16 == 993);
+
+    count = run_hybrid("radio", vector_query, VECTOR_DIM, 2u, hits, &status);
+    CHECK(status == SEARCH_OK && count == 2u && hits[0].chunk_id == 0u && hits[1].chunk_id == 5u);
+
+    /* No BM25 hits: the vector ranking alone, scored by rank. */
+    count = run_hybrid("the and of", vector_query, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK && count == CHUNK_COUNT);
+    CHECK(hits[0].chunk_id == 0u && hits[0].score_q16 == 1074);
+    CHECK(hits[1].chunk_id == 1u && hits[1].score_q16 == 1057);
+    CHECK(hits[2].chunk_id == 5u && hits[2].score_q16 == 1040);
+
+    /* The BM25 side's errors come through. */
+    run_hybrid("a1 b2 c3 d4 e5 f6 g7 h8 i9 j10 k11 l12 m13 n14 o15 p16 q17", vector_query, VECTOR_DIM,
+               SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_ERR_TOO_LARGE);
+    search_index_close(&index_);
+
+    /* Without vectors, hybrid is BM25: same hits, same scores, SEARCH_OK,
+     * whatever vector it is handed. */
+    write_file(fixture, fixture_length);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    keyword_count = run_query("Antenna, RADIO?", SEARCH_MAX_HITS, keyword, &status);
+    count = run_hybrid("Antenna, RADIO?", vector_query, VECTOR_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK);
+    CHECK(count == keyword_count && count == 3u);
+    for (i = 0u; i < count; i++) {
+        CHECK(hits[i].chunk_id == keyword[i].chunk_id && hits[i].score_q16 == keyword[i].score_q16);
+    }
+    count = run_hybrid("radio", NULL, 0u, 1u, hits, &status);
+    CHECK(status == SEARCH_OK && count == 1u && hits[0].chunk_id == 5u && hits[0].score_q16 == 66035);
+    search_index_close(&index_);
+}
+
+/* Vectors that straddle reads, scored against a dot product written out
+ * here, and the scan reading the section once. */
+static void check_vector_stream(void) {
+    static int8_t query[LONG_DIM];
+    search_hit_t hits[SEARCH_MAX_HITS];
+    int32_t expected[CHUNK_COUNT];
+    search_status_t status;
+    uint32_t before;
+    size_t count;
+    size_t chunk;
+    size_t i;
+
+    for (i = 0u; i < LONG_DIM; i++) {
+        query[i] = (int8_t)(i % 3u == 0u ? 100 : -(int)(i % 7u));
+    }
+    for (chunk = 0u; chunk < CHUNK_COUNT; chunk++) {
+        int64_t dot = 0;
+
+        for (i = 0u; i < LONG_DIM; i++) {
+            dot += query[i] * long_value(chunk, i);
+        }
+        /* round(dot x 65536 / 16129), half up; dot is never a tie. */
+        expected[chunk] = (int32_t)((dot * 65536 + (dot >= 0 ? 16129 / 2 : -(16129 / 2))) / 16129);
+    }
+
+    build_vector_fixture(LONG_DIM, fill_long);
+    CHECK(CHUNK_COUNT * LONG_DIM > 2u * SEARCH_IO_CHUNK);
+    CHECK(search_index_open(&index_, FIXTURE_FILE) == SEARCH_OK);
+    before = index_.bytes_read;
+    count = run_vectors(query, LONG_DIM, SEARCH_MAX_HITS, hits, &status);
+    CHECK(status == SEARCH_OK && count == CHUNK_COUNT);
+    CHECK(index_.bytes_read - before == CHUNK_COUNT * LONG_DIM);
+    for (i = 0u; i < count; i++) {
+        CHECK(hits[i].score_q16 == expected[hits[i].chunk_id]);
+        CHECK(i == 0u || hits[i - 1u].score_q16 > hits[i].score_q16 ||
+              (hits[i - 1u].score_q16 == hits[i].score_q16 && hits[i - 1u].chunk_id < hits[i].chunk_id));
+    }
+    search_index_close(&index_);
+    write_file(fixture, fixture_length);
+}
+
 static void check_tokenizer_pieces(void) {
     CHECK(search_index_hash("radio", 5u) == fnv1a("radio"));
     CHECK(search_index_hash("", 0u) == 2166136261u);
@@ -553,6 +833,10 @@ void test_search_index(void) {
     check_arguments();
     check_damaged();
     check_tokenizer_pieces();
+    check_vector_ranking();
+    check_vector_errors();
+    check_hybrid();
+    check_vector_stream();
 
     remove(FIXTURE_FILE);
 }
