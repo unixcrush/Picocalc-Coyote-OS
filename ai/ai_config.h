@@ -14,6 +14,8 @@
 #define AI_CONFIG_MODEL_CAPACITY 129u
 #define AI_CONFIG_BEARER_TOKEN_CAPACITY 257u
 #define AI_CONFIG_KEY_CAPACITY 32u
+#define AI_CONFIG_EMBED_URL_CAPACITY 256u
+#define AI_CONFIG_EMBED_MODEL_CAPACITY AI_CONFIG_MODEL_CAPACITY
 #define AI_CONFIG_LINE_MAX 512u
 
 /* Inclusive numeric bounds accepted by the parser and serializer. */
@@ -34,6 +36,11 @@
 /* UTC-12:00 to UTC+14:00, the span of offsets in civil use. */
 #define AI_CONFIG_UTC_OFFSET_MINUTES_MIN (-720)
 #define AI_CONFIG_UTC_OFFSET_MINUTES_MAX 840
+/* The embedding service for search queries.  An empty embed_url means "use
+ * the selected provider's endpoint".  It has no credential of its own: LAN
+ * embedding services (Ollama) need none, and the provider's key is never sent
+ * to a different host. */
+#define AI_CONFIG_EMBED_MODEL_DEFAULT "nomic-embed-text"
 
 #define AI_CONFIG_PROVIDER_OLLAMA "ollama"
 #define AI_CONFIG_PROVIDER_MUSE "muse"
@@ -104,13 +111,15 @@ typedef struct {
     char system_prompt[AI_CONFIG_SYSTEM_PROMPT_CAPACITY];
     uint16_t temperature;
     int16_t utc_offset_minutes; /* local time is UTC plus this */
+    char embed_url[AI_CONFIG_EMBED_URL_CAPACITY];       /* base URL, or empty */
+    char embed_model[AI_CONFIG_EMBED_MODEL_CAPACITY];
 } ai_config_t;
 
 typedef struct {
     ai_config_t *config;
     char line[AI_CONFIG_LINE_MAX + 1u];
     size_t line_length;
-    uint16_t seen_keys;
+    uint32_t seen_keys;
     ai_config_status_t status;
     char error_key[AI_CONFIG_KEY_CAPACITY];
     unsigned char pending_cr;

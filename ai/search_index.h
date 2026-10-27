@@ -6,10 +6,10 @@
 #include <stdio.h>
 
 /*
- * Keyword (BM25) search over a card-resident CYX1 index built on a host by
- * tools/search_index/build_index.py.  docs/design/on-device-search.md pins the
- * file format, the tokenizer and the scoring; this reader and the builder
- * must agree on all three.
+ * Keyword (BM25), vector and hybrid search over a card-resident CYX1 index
+ * built on a host by tools/search_index/build_index.py.
+ * docs/design/on-device-search.md pins the file format, the tokenizer and the
+ * scoring; this reader and the builder must agree on all three.
  *
  * Nothing allocates.  search_index_t holds every buffer it needs and is small
  * enough to keep as a static.  Opening checks the header and the CRC (streamed
@@ -39,6 +39,17 @@ enum {
 #define SEARCH_TERM_ENTRY_SIZE 12u
 #define SEARCH_POSTING_SIZE 6u
 #define SEARCH_DOC_ENTRY_SIZE 12u
+
+/* Header flags and vector element types. */
+#define SEARCH_FLAG_NORMALIZED 0x0001u
+#define SEARCH_FLAG_INT8 0x0002u
+#define SEARCH_DTYPE_NONE 0u
+#define SEARCH_DTYPE_INT8 1u
+#define SEARCH_DTYPE_F32 2u
+
+/* Reciprocal rank fusion: a chunk at rank r (from 1) in a list adds
+ * 1 / (SEARCH_RRF_K + r) to its fused score. */
+#define SEARCH_RRF_K 60u
 
 /* Tokens are 2 to 32 bytes of [a-z0-9_]. */
 #define SEARCH_TOKEN_MIN 2u
@@ -74,11 +85,15 @@ typedef enum {
     SEARCH_ERR_IO,
     SEARCH_ERR_FORMAT,
     SEARCH_ERR_TOO_LARGE,
+    SEARCH_ERR_DIM,        /* the query vector's length is not the index's dim */
+    SEARCH_ERR_NO_VECTORS, /* the index was built without vectors */
 } search_status_t;
 
 typedef struct {
     uint32_t chunk_id;
-    int32_t score_q16; /* BM25 score x 65536, for ordering and display */
+    /* x 65536, for ordering and display: the BM25 score, the cosine of a
+     * vector query or the fused score of a hybrid one. */
+    int32_t score_q16;
 } search_hit_t;
 
 typedef struct {
@@ -146,6 +161,34 @@ search_status_t search_index_read_title(search_index_t *index, uint32_t chunk_id
                                         char *buf, size_t capacity);
 search_status_t search_index_read_body(search_index_t *index, uint32_t chunk_id,
                                        char *buf, size_t capacity);
+
+/*
+ * Ranks every chunk by the dot product of its int8 vector with query, best
+ * first, ties by lower chunk id; score_q16 is dot x 65536 / (127 x 127),
+ * rounded half up, which is the cosine for vectors normalized as the builder
+ * normalizes them.  Low and negative scores are ranked too: any chunk can be a
+ * nearest neighbour.  At most min(max_hits, SEARCH_MAX_HITS) hits are written.
+ * The vectors section is streamed through io in SEARCH_IO_CHUNK pieces and
+ * only the best hits are kept.  SEARCH_ERR_NO_VECTORS for an index without
+ * vectors, SEARCH_ERR_DIM when dim is not the index's.
+ */
+search_status_t search_index_query_vectors(search_index_t *index, const int8_t *query,
+                                           size_t dim, search_hit_t *hits, size_t max_hits,
+                                           size_t *hit_count);
+/*
+ * Fuses the BM25 ranking of text and the vector ranking of query_vector, each
+ * SEARCH_MAX_HITS deep, by reciprocal rank fusion: a chunk scores the sum over
+ * the lists it is in of 1 / (SEARCH_RRF_K + rank), rank from 1.  Hits are
+ * ordered by that exact sum, then by lower chunk id; score_q16 is the sum x
+ * 65536 rounded half up.  Only chunks one of the lists returned are returned.
+ * An index without vectors gives search_index_query's result for text, and
+ * then query_vector and dim are not looked at.  Otherwise SEARCH_ERR_DIM when
+ * dim is not the index's; a BM25 error (SEARCH_ERR_TOO_LARGE) is returned as
+ * is.
+ */
+search_status_t search_index_query_hybrid(search_index_t *index, const char *text,
+                                          const int8_t *query_vector, size_t dim,
+                                          search_hit_t *hits, size_t max_hits, size_t *hit_count);
 
 /* The tokenizer's pieces, exposed for tests. */
 uint32_t search_index_hash(const char *bytes, size_t length);

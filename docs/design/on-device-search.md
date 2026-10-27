@@ -203,3 +203,134 @@ Python, in `tools/search_index/test_build_index.py` (stdlib `unittest`):
 3. `python3 tools/search_index/build_index.py --corpus <fixture dir> --out /tmp/a.idx` then
    `--index /tmp/a.idx --query "..."` returns the expected order.
 4. The firmware still cross-builds for `pico2_w` with no new warnings.
+
+## Round 2: vectors and hybrid search
+
+Round 1 left section 4 empty. Round 2 fills it and adds the query side. The device still never
+embeds text locally: it asks an OpenAI-compatible endpoint for the query vector and scores that
+against the card.
+
+### Builder
+
+```
+python3 tools/search_index/build_index.py --corpus DIR --out FILE \
+    --embed-url http://wang.local:11434 --model nomic-embed-text
+python3 tools/search_index/build_index.py ... --vectors FILE   # offline, for tests
+```
+
+- Posts chunks in batches (at most 32 per request) to `{embed-url}/v1/embeddings` with
+  `{"input": [...], "model": "..."}`. Accepts `{"data":[{"embedding":[...]}], ...}` in input
+  order; a response whose count or dimension disagrees is an error, not a silent truncation.
+- L2-normalizes each vector, then quantizes with `q = round(v * 127)`, clamped to [-127, 127].
+  Sets `dim`, `model_id` (the model string, truncated to 63 bytes), flag bit0 (normalized) and
+  bit1 (int8).
+- `--vectors FILE` reads precomputed vectors, one JSON array per line in chunk order, and writes
+  the same layout. This is how the tests run without a network.
+- `--query` gains `--embed-url`/`--model` so the reference query path can score a vector too,
+  and reports BM25, vector and fused results separately.
+
+### Configuration
+
+Two new fields in `ai_config`, both persisted in `ai.ini`:
+
+- `embed_url` — base URL of the embedding service, e.g. `http://wang.local:11434`. Empty means
+  "use the selected provider's endpoint"; that is the default and needs no typing.
+- `embed_model` — model name, default `nomic-embed-text`.
+
+No credential is added in this round: LAN embedding endpoints (Ollama) are keyless. A keyed
+endpoint needs a credential slot, which is a later round; do not reuse the provider key for a
+different host.
+
+### Reader
+
+```c
+search_status_t search_index_query_vectors(search_index_t *index, const int8_t *query,
+                                           size_t dim, search_hit_t *hits, size_t max_hits,
+                                           size_t *hit_count);
+search_status_t search_index_query_hybrid(search_index_t *index, const char *text,
+                                          const int8_t *query_vector, size_t dim,
+                                          search_hit_t *hits, size_t max_hits, size_t *hit_count);
+```
+
+- `dim` must equal the index `dim`, otherwise `SEARCH_ERR_DIM` (new status). An index with
+  `dim == 0` has no vectors: the vector call returns `SEARCH_ERR_NO_VECTORS`, the hybrid call
+  falls back to BM25 and returns `SEARCH_OK`.
+- Vector score is the int32 dot product of two int8 vectors divided by `127 * 127`, expressed
+  as Q16 like the BM25 score.
+- Hybrid uses reciprocal rank fusion over the two ranked lists: `score = sum(1 / (60 + rank))`
+  with rank starting at 1, deduplicated by chunk id, ordered by fused score descending and then
+  by lower chunk id. It never returns a chunk neither list returned.
+- The vectors section is streamed in `SEARCH_IO_CHUNK` pieces; only the top-k are kept, so N
+  chunks cost N × dim bytes of reads and no extra memory.
+
+### Embedding client (device)
+
+`ai/embed_client.{c,h}` builds the request and parses the response; it owns no UI and no
+scheduling.
+
+```c
+typedef enum {
+    EMBED_OK = 0,
+    EMBED_ERR_ARGUMENT,
+    EMBED_ERR_DIM,
+    EMBED_ERR_HTTP,
+    EMBED_ERR_PARSE,
+} embed_status_t;
+
+/* Text limit; longer input is EMBED_ERR_ARGUMENT. */
+#define EMBED_TEXT_MAX 512
+
+/* Builds the request body. Returns the length written, or 0. */
+size_t embed_client_body(char *body, size_t capacity, const char *model, const char *text);
+
+/* Parses {"data":[{"embedding":[...]}]} into dim int8 values, L2-normalized and quantized
+ * exactly as the builder does. Returns EMBED_ERR_DIM when the vector length disagrees. */
+embed_status_t embed_client_parse(const char *json, size_t length, int8_t *out, size_t dim);
+```
+
+- JSON parsing must tolerate whitespace, exponents and negative values, and reject a response
+  with no `embedding` array.
+- Quantization here and in the builder must be the same arithmetic; a test compares them.
+- The HTTP transport is not part of this round: the caller owns the request and feeds it the
+  response body. This keeps the round verifiable without a radio and without touching
+  `app_services` or `UI/`.
+
+### Tests
+
+C, `tests/test_search_index.c` additions:
+- Vector scan over a fixture with known vectors ranks by cosine, not by magnitude.
+- `dim` mismatch leads to `SEARCH_ERR_DIM`; no vectors leads to `SEARCH_ERR_NO_VECTORS`; hybrid
+  falls back to BM25 and still returns `SEARCH_OK`.
+- RRF ordering for a chunk that is 1st in BM25 and 3rd in vectors, and vice versa.
+- `embed_client_parse` on canned responses: whitespace, exponents, negatives, too few values,
+  no data, empty body; and that parsing the builder's stored vector reproduces it exactly.
+
+Python:
+- Batch splitting, model_id and dim in the header, normalization, quantization, and that a
+  response of the wrong length is rejected.
+
+### Behaviours round 2 pins
+
+- A vector query ranks every chunk, including those with a negative cosine; the caller decides
+  how far down the list to show.
+- Hybrid takes `SEARCH_MAX_HITS` from each list before fusing, so a chunk outside the top eight
+  of both lists is never returned.
+- On an index with no vectors, hybrid returns the BM25 result whatever vector or length it is
+  handed, even none.
+- An index whose `dtype` is float32 has no vector support yet: the vector query returns
+  `SEARCH_ERR_FORMAT` rather than guessing.
+- The response parser rejects an empty model name, a reply carrying more than one embedding, and
+  an all-zero vector.
+- Chunks are embedded exactly as stored (`title\nbody`). `nomic-embed-text` recommends
+  `search_document:` / `search_query:` prefixes; they are not applied here because the builder
+  must stay model-agnostic. Adding `--doc-prefix` / `--query-prefix` (default empty) is the open
+  improvement.
+- Python's compensated `sum()` is avoided in the builder so its accumulation matches the C
+  loop bit for bit; both sides round half to even.
+
+### Acceptance for round 2
+
+1. Host C suite and Python suite pass with no pre-existing expectation changed.
+2. A real index built from the vault with `nomic-embed-text` on wang: the Python reference and
+   the C reader agree on the top-5 for both BM25 and vector queries.
+3. Firmware still cross-builds for `pico2_w`, 0 warnings.
