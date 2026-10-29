@@ -190,6 +190,42 @@ search_status_t search_index_query_hybrid(search_index_t *index, const char *tex
                                           const int8_t *query_vector, size_t dim,
                                           search_hit_t *hits, size_t max_hits, size_t *hit_count);
 
+/*
+ * Reads whole vectors starting at chunk first_chunk_id into buf: as many as fit
+ * in capacity and remain, in one read; *chunk_count says how many (0 when
+ * first_chunk_id is past the last chunk).  SEARCH_ERR_TOO_LARGE when not even
+ * one vector fits, SEARCH_ERR_NO_VECTORS / SEARCH_ERR_FORMAT as the vector
+ * query.  The caller's side of handing a block to the core 1 worker.
+ */
+search_status_t search_index_read_vector_block(search_index_t *index, uint32_t first_chunk_id, uint8_t *buf,
+                                               size_t capacity, size_t *chunk_count);
+/*
+ * Scores vectors that are already in memory, so it touches no file: block holds
+ * block_length / dim whole int8 vectors, the first of them chunk first_chunk_id.
+ * Ranks them as search_index_query_vectors does (same score, same ties) into
+ * hits, at most min(max_hits, SEARCH_MAX_HITS).  SEARCH_ERR_ARGUMENT for a null
+ * pointer, dim 0, a block_length that is not a whole number of vectors or chunk
+ * ids that would pass 2^32 - 1.  Blocks scored in rising chunk order and merged
+ * with search_index_keep_hit rank exactly as one search_index_query_vectors
+ * pass does; this is what the core 1 worker (ai/search_worker.h) runs.
+ */
+search_status_t search_index_score_block(const int8_t *query, size_t dim, const uint8_t *block,
+                                         size_t block_length, uint32_t first_chunk_id,
+                                         search_hit_t *hits, size_t max_hits, size_t *hit_count);
+/*
+ * Inserts one hit into hits[0..*count), kept best first, with at most capacity
+ * entries; a hit that ranks below a full list is dropped, and one that ties
+ * with an earlier hit goes after it, so feed chunks in rising id order.
+ */
+void search_index_keep_hit(search_hit_t *hits, size_t capacity, size_t *count, uint32_t chunk_id,
+                           int32_t score_q16);
+/*
+ * The reciprocal rank fusion step of search_index_query_hybrid, on two ranked
+ * lists (each read up to SEARCH_MAX_HITS deep).  No file is touched.
+ */
+void search_index_fuse(const search_hit_t *keyword, size_t keyword_count, const search_hit_t *nearest,
+                       size_t nearest_count, search_hit_t *hits, size_t max_hits, size_t *hit_count);
+
 /* The tokenizer's pieces, exposed for tests. */
 uint32_t search_index_hash(const char *bytes, size_t length);
 int search_index_is_stopword(const char *token, size_t length);

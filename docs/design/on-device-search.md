@@ -334,3 +334,111 @@ Python:
 2. A real index built from the vault with `nomic-embed-text` on wang: the Python reference and
    the C reader agree on the top-5 for both BM25 and vector queries.
 3. Firmware still cross-builds for `pico2_w`, 0 warnings.
+
+## Round 3: vector scoring on core 1
+
+Vector and hybrid search read every vector on the card, so a query keeps core 0 busy for as
+long as the card takes to stream N × dim bytes. Round 3 moves the arithmetic of that pass to
+RP2350 core 1 so the main loop and UI can run between steps. The synchronous APIs are
+untouched and still the reference: the offloaded path must return exactly their hits.
+
+### Ownership
+
+| Thing | Owner | Why |
+| --- | --- | --- |
+| The open index, its `FILE *`, the SD card, FatFs | core 0, always | the card is not shared, and `usb_disk_mode` must be able to take it |
+| Wi-Fi / lwIP / TLS, UI, keyboard | core 0 | unchanged; none of it moves |
+| BM25 half of a hybrid query | core 0, synchronous | card-bound, not CPU-bound; see limits |
+| int8 dot products, top-k of one block | core 1 | pure CPU over memory the job carries |
+
+Core 1 never calls `fopen`, `fread`, `fclose`, FatFs or stdio, and never allocates.
+`ai/search_worker.c` includes none of them; its only undefined symbols are `memcpy`, the block
+scorer and the three platform hooks. No file is held open "across cores": core 0 opens the
+index, and core 1 is only ever given bytes.
+
+### Design: core 0 reads, core 1 scores one block at a time
+
+The simpler safe choice was to stream, not to snapshot. A whole vectors section does not
+fit a bounded buffer (768 dims × 1000 chunks is 750 KB), so a snapshot would cap index size.
+Instead core 0 reads one block of whole vectors (at most `SEARCH_WORKER_BLOCK_BYTES`, 4096,
+so 5 vectors at dim 768) into the index's existing `io` buffer and submits it. The worker
+**copies** the query and block into its own fixed buffers, so core 0 may reuse `io` and read
+the next block while core 1 scores the last. Core 1 returns the best `SEARCH_MAX_HITS` of that
+block; core 0 merges them in rising chunk order with `search_index_keep_hit`. The global top
+eight is always inside the union of the blocks' top eights, and ties still go to the lower
+chunk id because blocks are merged in order, so the result equals `search_index_query_vectors`
+(tests compare them, including a tie across a block boundary).
+
+New pure helpers in `search_index.h` (no `FILE`): `search_index_score_block`,
+`search_index_keep_hit`, `search_index_fuse` (the RRF step, now shared with
+`search_index_query_hybrid`), and `search_index_read_vector_block` (core 0's read).
+
+### API
+
+`ai/search_worker.h` (the worker; hardware-free):
+
+```c
+search_worker_status_t search_worker_init(void);
+search_worker_status_t search_worker_submit_vector(const int8_t *query, size_t dim,
+        const uint8_t *block, size_t block_length, uint32_t first_chunk_id);
+search_worker_state_t  search_worker_poll(void);
+search_worker_status_t search_worker_take_result(search_worker_result_t *result);
+search_worker_status_t search_worker_shutdown(void);
+int search_worker_run_pending(void);   /* core 1's side; tests call it in place of core 1 */
+```
+
+`ai/search_vector_job.h` (core 0's driver over an open index):
+`search_vector_job_begin` / `_begin_hybrid`, `_poll`, `_result`, `_status`, `_cancel`. Each
+`_poll` does at most one bounded read, one submit and one result take, and never waits.
+
+Bounds: `dim` 1..`SEARCH_WORKER_MAX_DIM` (1024), block ≤ 4096 bytes and a whole number of
+vectors. Anything else is refused at submit and nothing is queued. Static memory is about 6 KB
+(the job slot 5.2 KB, a job 1.1 KB).
+
+### Concurrency model
+
+```
+STOPPED --init--> IDLE --submit--> QUEUED --core1--> RUNNING --core1--> DONE --take--> IDLE
+                   ^ shutdown (IDLE only) -> STOPPED
+```
+
+- One word, `state`, is the only thing both cores race on. Each state has one owner (core 0 in
+  STOPPED, IDLE and DONE; core 1 in QUEUED and RUNNING) and only the owner touches the slot's
+  other fields. Hand-over is a release store, pick-up an acquire load
+  (`__atomic_*`, which the compiler turns into `dmb`), so a core sees everything the other
+  wrote before it handed over. Core 1 claims the job with a compare-exchange QUEUED → RUNNING,
+  so a stray or doubled wake does nothing.
+- Submit while not IDLE returns `SEARCH_WORKER_BUSY` and leaves the running job alone; so does
+  shutdown. An untaken result keeps the worker DONE, so it also blocks a new job: one result
+  is never overwritten.
+- Wake-up is the SDK multicore FIFO (`search_worker_pico.c`): core 1 sleeps in
+  `multicore_fifo_pop_blocking()` (WFE), core 0 pushes one doorbell word with a zero timeout.
+  At most one job is in flight, so the 8-deep FIFO cannot fill. Core 0 never spins: it learns of
+  completion by polling `state` from the main loop. `FreeRTOS` is not used.
+- Shutdown (IDLE only) resets core 1 with `multicore_reset_core1()`; `init` can start it again.
+  Core 1 calls `multicore_lockout_victim_init()` so a future flash write on core 0 can pause it;
+  nothing writes flash today.
+- The platform seam is three functions (`search_worker_platform_start/wake/stop`). The firmware
+  links `search_worker_pico.c`; the host tests define fakes and call `search_worker_run_pending`
+  themselves, so they need no Pico SDK.
+
+### Limits of this slice
+
+- **Not hardware-tested.** No board was connected. Verified: the host suite (state transitions,
+  rejection while busy, result delivery, dim and length bounds, shutdown and re-init,
+  equivalence with the synchronous queries), a ThreadSanitizer run of the same worker code with a
+  pthread standing in for core 1 (20,000 jobs and shutdown/re-init cycles, clean), and that the
+  firmware compiles and links for `pico2_w` with `-Wall -Wextra -Werror` on the new files.
+  Real multicore launch, WFE wake-up, the default core 1 stack (2 KB, enough for this code's
+  frames but unmeasured), SRAM contention with the SD DMA, and the actual speed-up are unproven.
+- **The gain is small until proven.** A 4 KB block is about 4,000 multiply-accumulates, an estimated ~0.1 ms on core 1 (not measured); the
+  SD read that feeds it is the larger cost and stays on core 0. What this buys is that the
+  scoring and the top-k bookkeeping overlap the next read, and that core 0's work per poll is one
+  bounded read. It does not make the card faster. Measure before relying on it.
+- Hybrid runs its BM25 half in `_begin_hybrid`, synchronously on core 0. BM25 is a few small
+  reads, but it does block the loop for their duration.
+- Only the int8 path. A float32 index is `SEARCH_ERR_FORMAT`, as in the synchronous query.
+- `main.c`, `UI/` and the provider code are untouched: nothing calls `search_worker_init()` yet.
+  Whoever wires a search UI must: init once, drive `search_vector_job_poll` from the idle hook,
+  and cancel and drain a job before `usb_disk_mode` unmounts the card.
+- A core 1 that hangs leaves a job PENDING forever; there is no timeout.

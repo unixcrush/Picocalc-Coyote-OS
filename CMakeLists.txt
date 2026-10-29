@@ -46,6 +46,11 @@ add_executable(coyote
         ai/wifi_scan.c
         ai/search_index.c
         ai/embed_client.c
+        # Core 1 scores vectors; core 0 owns the card.  search_worker.c is
+        # hardware-free, search_worker_pico.c is the multicore glue.
+        ai/search_worker.c
+        ai/search_worker_pico.c
+        ai/search_vector_job.c
         time/time_sync.c
         time/time_service.c
         ai/http_stream.c
@@ -194,6 +199,11 @@ else()
     message(WARNING "PICO_BOARD has no CYW43 radio: building without Wi-Fi (use -DPICO_BOARD=pico2_w)")
 endif()
 
+
+# The core 1 worker is held to the same bar as the host tests.
+set_source_files_properties(
+    ai/search_worker.c ai/search_worker_pico.c ai/search_vector_job.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 
 pico_enable_stdio_usb(coyote 0)
 pico_enable_stdio_uart(coyote 1)
