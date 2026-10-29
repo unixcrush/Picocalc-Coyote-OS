@@ -66,6 +66,7 @@ void test_mode_menu(void);
 void test_usb_disk(void);
 void test_search_index(void);
 void test_embed_client(void);
+void test_search_worker(void);
 
 int main(void) {
     test_json_stream();
@@ -93,6 +94,7 @@ int main(void) {
     test_usb_disk();
     test_search_index();
     test_embed_client();
+    test_search_worker();
 
     printf("%d checks, %d failures\n", g_tests_run, g_tests_failed);
     return g_tests_failed == 0 ? 0 : 1;
